@@ -1,0 +1,36 @@
+listen: ":8080"
+# A new poll starts this long after the previous poll finishes.
+interval: 6h
+# Total time budget per repository; also used for the Docker comparison phase.
+timeout: 5m
+state_file: /data/state.json
+history_days: 30
+
+# Opt-in only. Leave empty when the Docker socket is unavailable.
+docker_socket: ""
+# docker_socket: /var/run/docker.sock
+
+repositories:
+  # No host means Docker Hub. Bare official names such as "alpine" also work.
+  - image: stalwartlabs/stalwart
+    semver_only: true
+    include_prereleases: true
+    # Regular expressions: any allow match is enough; any deny match wins.
+    # An empty allow list permits every tag allowed by the SemVer policy.
+    allow: ['^v\d+\.\d+\.\d+(-alpine)?$']
+    deny:
+      - "(?i)(nightly|pr[-_])"
+    # Optional when Docker is unavailable: report versions newer than this tag,
+    # including on the very first check. Use a full SemVer tag, e.g.:
+    # baseline: "v0.11.0"
+
+  # Additional examples (only publicly readable repositories are supported):
+  # - image: mcr.microsoft.com/dotnet/runtime
+  # - image: gcr.io/distroless/static-debian12
+  # - image: us-docker.pkg.dev/my-project/my-repository/my-image
+
+  # To track mutable tags such as latest as well:
+  # - image: alpine
+  #   semver_only: false
+  #   allow: ['^latest$', '^v?[0-9]+\.[0-9]+\.[0-9]+$']
+  #   deny: ['(?i)(nightly|rc|beta|alpha|pr[-_])']

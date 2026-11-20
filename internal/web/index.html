@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tagwatch — container image updates</title>
+<style>
+:root { color-scheme: light dark; --bg:#f7f6f2; --fg:#202b29; --muted:#52605b; --line:#b8c2bb; --accent:#175e48; --warn:#873818; }
+* { box-sizing:border-box; }
+body { margin:0 auto; max-width:76rem; padding:2rem 1rem; background:var(--bg); color:var(--fg); font:1rem/1.6 system-ui,sans-serif; }
+header { border-top:4px solid var(--accent); padding-top:1rem; }
+h1 { margin:.2rem 0; font: bold 2.4rem/1.2 Georgia,serif; }
+h2 { font-size:1.35rem; overflow-wrap:anywhere; }
+h3 { font-size:1rem; margin-top:1.5rem; }
+p { margin:.5rem 0; }
+.meta, footer { color:var(--muted); font-size:.9rem; }
+section { border-top:1px solid var(--line); margin-top:2rem; padding-top:.5rem; }
+.error { border-left:3px solid var(--warn); padding:.5rem 1rem; color:var(--warn); overflow-wrap:anywhere; }
+.scroll { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; text-align:left; font-size:.95rem; }
+th, td { padding:.65rem .6rem; border-bottom:1px solid var(--line); vertical-align:top; }
+th:first-child, td:first-child { padding-left:0; }
+code { font: .9em/1.5 ui-monospace,monospace; overflow-wrap:anywhere; }
+details { max-width:35rem; }
+summary { cursor:pointer; }
+summary:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+li { margin:.3rem 0; }
+footer { margin-top:3rem; padding-top:1rem; border-top:1px solid var(--line); }
+@media(prefers-color-scheme:dark) { :root { --bg:#18211e; --fg:#e3e9e4; --muted:#b0beb5; --line:#53695c; --accent:#8bd5b0; --warn:#ffb48c; } }
+</style>
+</head>
+<body>
+<header>
+<p class="meta">CONTAINER IMAGE UPDATE REPORT</p>
+<h1>Tagwatch</h1>
+<p>New releases. Changed image digests. Nothing deployed automatically.</p>
+<p class="meta">Report generated: {{time .Generated}} · Poll delay: {{.Interval}} after each check</p>
+<p class="meta">{{.DockerStatus}}</p>
+</header>
+{{if .StateError}}<p class="error" role="alert">{{.StateError}}</p>{{end}}
+{{range .Repositories}}
+<section aria-label="{{.Image}}">
+<h2><code>{{.Image}}</code></h2>
+<p class="meta">Last successful check: {{time .LastSuccess}} · Last attempt: {{time .LastAttempt}} · {{.TagCount}} tracked tags</p>
+{{if .Error}}<p class="error" role="alert">Check failed; showing previous successful results. {{.Error}}</p>{{end}}
+{{if not .Initialized}}<p>Waiting for the first successful check to establish a baseline.</p>{{end}}
+{{range .Running}}
+<h3>Running: {{.Name}}</h3>
+<p><code>{{.Image}}</code></p>
+<p>{{.Status}}</p>
+{{if .Updates}}<p>Newer matching versions:</p><ul>{{range .Updates}}<li><code>{{.}}</code></li>{{end}}</ul>{{else}}<p class="meta">No newer matching versions found, or version ordering is unavailable.</p>{{end}}
+{{end}}
+{{if .Baseline}}
+<h3>Versions newer than configured baseline <code>{{.Baseline}}</code></h3>
+{{if .Updates}}<ul>{{range .Updates}}<li><code>{{.}}</code></li>{{end}}</ul>{{else}}<p class="meta">No newer matching versions found.</p>{{end}}
+{{end}}
+<h3>Observed changes · last {{$.HistoryDays}} days</h3>
+{{if .History}}
+<div class="scroll"><table>
+<caption class="meta">Newly observed tags and digest changes since the initial baseline</caption>
+<thead><tr><th scope="col">Tag</th><th scope="col">Change</th><th scope="col">Detected (UTC)</th><th scope="col">Digest</th></tr></thead>
+<tbody>{{range .History}}<tr>
+<td><code>{{.Tag}}</code></td><td>{{.Kind}}</td><td>{{time .Detected}}</td>
+<td><details><summary>Show digest{{if .Previous}} change{{end}}</summary>{{if .Previous}}<div>Before: <code>{{.Previous}}</code></div>{{end}}<div>Now: <code>{{.Digest}}</code></div></details></td>
+</tr>{{end}}</tbody>
+</table></div>
+{{else}}<p class="meta">No changes recorded in this period. The first successful check establishes the baseline without reporting existing tags as new.</p>{{end}}
+</section>
+{{end}}
+<footer>
+<p>Detection times record when Tagwatch observed a change, not the registry push time. Reload this page to see the latest report.</p>
+<p>Version comparisons use SemVer precedence. Index digest changes may affect a different platform; running-image comparisons use the container's platform and image config digest.</p>
+</footer>
+</body>
+</html>

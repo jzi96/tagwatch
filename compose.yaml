@@ -1,0 +1,36 @@
+services:
+  tagwatch-init:
+    build: .
+    image: tagwatch:local
+    user: "0:0"
+    entrypoint: ["chown", "-R", "10001:10001", "/data"]
+    volumes:
+      - tagwatch-data:/data
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+
+  tagwatch:
+    build: .
+    image: tagwatch:local
+    restart: unless-stopped
+    depends_on:
+      tagwatch-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./config.yaml:/etc/tagwatch/config.yaml:ro
+      - tagwatch-data:/data
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  tagwatch-data:

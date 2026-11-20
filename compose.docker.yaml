@@ -1,0 +1,8 @@
+# Optional override: also set docker_socket in config.yaml.
+# Set DOCKER_GID to the numeric group owning the host Docker socket.
+services:
+  tagwatch:
+    group_add:
+      - "${DOCKER_GID:?Set DOCKER_GID to the Docker socket group ID}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
