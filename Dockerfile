@@ -14,7 +14,7 @@ RUN apk add --no-cache ca-certificates \
     && mkdir /data \
     && chown tagwatch:tagwatch /data
 COPY --from=build /out/tagwatch /usr/local/bin/tagwatch
-COPY config.yaml /etc/tagwatch/config.yaml
+COPY config.example.yaml /etc/tagwatch/config.yaml
 USER 10001:10001
 EXPOSE 8080
 VOLUME ["/data"]
