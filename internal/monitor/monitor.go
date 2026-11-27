@@ -26,10 +26,12 @@ type Runtime interface {
 }
 
 type RunningReport struct {
-	Name    string
-	Image   string
-	Status  string
-	Updates []string
+	Name           string
+	Image          string
+	Tag            string
+	Status         string
+	Updates        []string
+	ContentMatches bool
 }
 
 type RepositoryReport struct {
@@ -235,11 +237,13 @@ func (m *Monitor) makeReport(s State, now time.Time) Report {
 			row.LastSuccess, row.LastAttempt = rs.LastSuccess, rs.LastAttempt
 			row.Initialized, row.Error, row.TagCount = rs.Initialized, rs.Error, len(rs.Tags)
 			cutoff := now.Add(-time.Duration(m.cfg.HistoryDays) * 24 * time.Hour)
+			visible := make([]Event, 0, len(rs.History))
 			for _, e := range rs.History {
 				if !e.Detected.Before(cutoff) && cfg.Accept(e.Tag) {
-					row.History = append(row.History, e)
+					visible = append(visible, e)
 				}
 			}
+			row.History = newestPerTag(visible)
 			sort.Slice(row.History, func(i, j int) bool {
 				a, b := row.History[i], row.History[j]
 				if a.Detected.Equal(b.Detected) {
@@ -254,6 +258,59 @@ func (m *Monitor) makeReport(s State, now time.Time) Report {
 		r.Repositories = append(r.Repositories, row)
 	}
 	return r
+}
+
+// newestPerTag collapses repeated changes of the same tag into the most recently
+// observed event. The persisted history keeps every change; only the report shows
+// one row per tag, so an upstream rebuild of a mutable tag is not listed once per poll.
+func newestPerTag(events []Event) []Event {
+	kept := make(map[string]Event, len(events))
+	for _, e := range events {
+		prev, ok := kept[e.Tag]
+		if !ok || !e.Detected.Before(prev.Detected) {
+			kept[e.Tag] = e
+		}
+	}
+	result := make([]Event, 0, len(kept))
+	for _, e := range kept {
+		result = append(result, e)
+	}
+	return result
+}
+
+// pendingChanges drops events that every running container of a repository already
+// provides, so an applied update disappears from the report. A container still
+// lagging behind keeps the event visible. A container on the exact tag counts as
+// deployed only while its platform image content still matches the registry, and
+// non-SemVer tags cannot be ordered, so anything else stays pending.
+func pendingChanges(events []Event, running []RunningReport) []Event {
+	if len(events) == 0 || len(running) == 0 {
+		return events
+	}
+	pending := make([]Event, 0, len(events))
+	for _, e := range events {
+		if !deployed(running, e.Tag) {
+			pending = append(pending, e)
+		}
+	}
+	return pending
+}
+
+func deployed(running []RunningReport, tag string) bool {
+	want := config.Version(tag)
+	for _, ctr := range running {
+		if ctr.Tag == tag {
+			if !ctr.ContentMatches {
+				return false
+			}
+			continue
+		}
+		if have := config.Version(ctr.Tag); want != nil && have != nil && !have.LessThan(want) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func newer(tags map[string]string, baseline string, cfg config.Repository) []string {
@@ -287,7 +344,7 @@ func (m *Monitor) addRunning(ctx context.Context, report *Report) {
 			if ctr.Repo != row.Canonical {
 				continue
 			}
-			running := RunningReport{Name: ctr.Name, Image: ctr.Image}
+			running := RunningReport{Name: ctr.Name, Image: ctr.Image, Tag: ctr.Tag}
 			if rs != nil {
 				running.Updates = newer(rs.Tags, ctr.Tag, cfg)
 			}
@@ -305,6 +362,7 @@ func (m *Monitor) addRunning(ctx context.Context, report *Report) {
 					running.Status = "Same tag now points to different image content for this platform."
 				default:
 					running.Status = "Same tag matches running image content for this platform."
+					running.ContentMatches = true
 				}
 				if config.Version(ctr.Tag) == nil {
 					running.Status += " Non-SemVer tag: version ordering unavailable."
@@ -313,5 +371,6 @@ func (m *Monitor) addRunning(ctx context.Context, report *Report) {
 			row.Running = append(row.Running, running)
 		}
 		sort.Slice(row.Running, func(i, j int) bool { return row.Running[i].Name < row.Running[j].Name })
+		row.History = pendingChanges(row.History, row.Running)
 	}
 }

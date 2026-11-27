@@ -57,14 +57,14 @@ footer { margin-top:3rem; padding-top:1rem; border-top:1px solid var(--line); }
 <h3>Observed changes · last {{$.HistoryDays}} days</h3>
 {{if .History}}
 <div class="scroll"><table>
-<caption class="meta">Newly observed tags and digest changes since the initial baseline</caption>
+<caption class="meta">{{if .Running}}Pending changes: newly observed tags and digest changes not yet running in every container of this repository{{else}}Newly observed tags and digest changes since the initial baseline{{end}}</caption>
 <thead><tr><th scope="col">Tag</th><th scope="col">Change</th><th scope="col">Detected (UTC)</th><th scope="col">Digest</th></tr></thead>
 <tbody>{{range .History}}<tr>
 <td><code>{{.Tag}}</code></td><td>{{.Kind}}</td><td>{{time .Detected}}</td>
 <td><details><summary>Show digest{{if .Previous}} change{{end}}</summary>{{if .Previous}}<div>Before: <code>{{.Previous}}</code></div>{{end}}<div>Now: <code>{{.Digest}}</code></div></details></td>
 </tr>{{end}}</tbody>
 </table></div>
-{{else}}<p class="meta">No changes recorded in this period. The first successful check establishes the baseline without reporting existing tags as new.</p>{{end}}
+{{else}}<p class="meta">{{if .Running}}No pending changes: every observed tag and digest change is already running in this repository's containers, or is older than it.{{else}}No changes recorded in this period. The first successful check establishes the baseline without reporting existing tags as new.{{end}}</p>{{end}}
 </section>
 {{end}}
 <footer>
