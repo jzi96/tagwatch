@@ -117,8 +117,124 @@ func TestBaselineChangesRestartAndFailure(t *testing.T) {
 	}
 	f.fail = ""
 	m.Poll(context.Background())
-	if len(getReport(m).Repositories[0].History) != 4 {
+	s, err = LoadState(cfg.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Repositories["index.docker.io/library/alpine"].History) != 4 {
 		t.Fatal("successful retry did not record changes")
+	}
+	// The persisted chain keeps both 1.0.0 digest changes; the report shows one row per tag.
+	if len(getReport(m).Repositories[0].History) != 3 {
+		t.Fatalf("report rows: %+v", getReport(m).Repositories[0].History)
+	}
+}
+
+func TestReportCollapsesRepeatedDigestChanges(t *testing.T) {
+	cfg := testConfig(t)
+	f := &fakeRegistry{tags: map[string]string{"1.0.0": "a"}}
+	m, err := New(cfg, f, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Poll(context.Background())
+	for _, digest := range []string{"b", "c"} {
+		f.tags["1.0.0"] = digest
+		m.Poll(context.Background())
+	}
+	row := getReport(m).Repositories[0]
+	if len(row.History) != 1 {
+		t.Fatalf("duplicate rows: %+v", row.History)
+	}
+	if row.History[0].Kind != "digest changed" || row.History[0].Previous != "b" || row.History[0].Digest != "c" {
+		t.Fatalf("stale event shown: %+v", row.History[0])
+	}
+	s, err := LoadState(cfg.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Repositories[row.Canonical].History) != 2 {
+		t.Fatalf("audit chain lost: %+v", s.Repositories[row.Canonical].History)
+	}
+}
+
+func TestDeployedChangesDisappear(t *testing.T) {
+	cfg := testConfig(t)
+	p := v1.Platform{OS: "linux", Architecture: "amd64"}
+	f := &fakeRegistry{tags: map[string]string{"v1.0.0": "a"}, configDigest: "sha256:current"}
+	m, err := New(cfg, f, fakeRuntime{containers: []docker.Container{
+		{Name: "app", Image: "alpine:v1.0.0", Repo: "index.docker.io/library/alpine", Tag: "v1.0.0", ImageID: "sha256:current", Platform: p},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Poll(context.Background())
+	f.tags["v1.1.0"] = "b"
+	m.Poll(context.Background())
+	row := getReport(m).Repositories[0]
+	if len(row.History) != 1 || row.History[0].Tag != "v1.1.0" {
+		t.Fatalf("pending update hidden: %+v", row.History)
+	}
+
+	// Deployed on every container: the entry vanishes, although state keeps it.
+	m, err = New(cfg, f, fakeRuntime{containers: []docker.Container{
+		{Name: "app", Image: "alpine:v1.1.0", Repo: "index.docker.io/library/alpine", Tag: "v1.1.0", ImageID: "sha256:current", Platform: p},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Poll(context.Background())
+	if len(getReport(m).Repositories[0].History) != 0 {
+		t.Fatalf("applied update still listed: %+v", getReport(m).Repositories[0].History)
+	}
+
+	// A canary container lagging behind keeps the update visible.
+	m, err = New(cfg, f, fakeRuntime{containers: []docker.Container{
+		{Name: "app", Image: "alpine:v1.1.0", Repo: "index.docker.io/library/alpine", Tag: "v1.1.0", ImageID: "sha256:current", Platform: p},
+		{Name: "canary", Image: "alpine:v1.0.0", Repo: "index.docker.io/library/alpine", Tag: "v1.0.0", ImageID: "sha256:current", Platform: p},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Poll(context.Background())
+	row = getReport(m).Repositories[0]
+	if len(row.History) != 1 || row.History[0].Tag != "v1.1.0" {
+		t.Fatalf("lagging container hid the update: %+v", row.History)
+	}
+}
+
+func TestNonSemverDeployedTagDisappears(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Repositories[0].SemverOnly = func() *bool { v := false; return &v }()
+	p := v1.Platform{OS: "linux", Architecture: "amd64"}
+	f := &fakeRegistry{tags: map[string]string{"latest": "a"}, configDigest: "sha256:old"}
+	m, err := New(cfg, f, fakeRuntime{containers: []docker.Container{
+		{Name: "app", Image: "alpine:latest", Repo: "index.docker.io/library/alpine", Tag: "latest", ImageID: "sha256:old", Platform: p},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Poll(context.Background())
+
+	// Upstream rebuilt the mutable tag; the container still runs the old content.
+	f.tags["latest"] = "b"
+	f.configDigest = "sha256:new"
+	m.Poll(context.Background())
+	row := getReport(m).Repositories[0]
+	if len(row.History) != 1 || !strings.Contains(row.Running[0].Status, "different image content") {
+		t.Fatalf("rebuilt mutable tag hidden: %+v", row)
+	}
+
+	// The container is rebuilt from the same tag name, so the change is deployed.
+	m, err = New(cfg, f, fakeRuntime{containers: []docker.Container{
+		{Name: "app", Image: "alpine:latest", Repo: "index.docker.io/library/alpine", Tag: "latest", ImageID: "sha256:new", Platform: p},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Poll(context.Background())
+	if len(getReport(m).Repositories[0].History) != 0 {
+		t.Fatalf("rebuilt tag change still listed: %+v", getReport(m).Repositories[0].History)
 	}
 }
 

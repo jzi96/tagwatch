@@ -30,8 +30,10 @@ docker compose up -d --build
 
 Open <http://localhost:8080>. The first successful check records a baseline; it
 does **not** report every existing tag as new. Subsequent new tags and digest
-changes appear in the report. With no running container or configured version
-baseline, updates are determined entirely by observations made since startup.
+changes appear in the report. With Docker enabled, a change already running in
+every container of that repository is hidden, so applied updates disappear. With
+no running container or configured version baseline, updates are determined
+entirely by observations made since startup.
 
 The named volume `tagwatch-data` preserves state across container replacements.
 Compose first runs a one-shot initializer that gives the volume to UID/GID
@@ -174,6 +176,12 @@ containers, or deploys anything.
 - `latest` and other non-SemVer tags can be checked for changed platform content,
   but cannot provide semantic version ordering. Digest-pinned containers are shown
   without guessing their release version.
+- Observed history becomes a **pending list** while containers run: an event is hidden
+  once every running container of that repository already provides the tag — either the
+  identical tag whose platform image content still matches, or a newer SemVer version.
+  A container lagging behind (for example a canary on the previous version) keeps the
+  event visible, and a container whose tag was rebuilt upstream keeps it too. Without
+  Docker, or with no container for the repository, history remains an observation log.
 - Version candidates come from the last successful registry check. Failed checks
   are visibly marked as stale; socket failures are also visible and do not erase
   registry history. If a running tag disappears upstream, comparison shows an error.
@@ -213,8 +221,11 @@ are discarded from state at the next successful state write.
 
 History is time-limited, not count-limited. Expired events are hidden on report
 generation and removed from a repository's persisted history at its next successful
-check. Large repositories and frequent digest changes can produce sizeable state
-files and pages; narrow filters and choose polling intervals responsibly.
+check. The report shows one row per tag: repeated digest changes of the same tag,
+such as a mutable tag rebuilt by the publisher, are collapsed into the most recently
+observed one, while the state file keeps the full chain for auditing. Large
+repositories and frequent digest changes can still produce sizeable state files;
+narrow filters and choose polling intervals responsibly.
 
 ### Why not modified dates?
 
