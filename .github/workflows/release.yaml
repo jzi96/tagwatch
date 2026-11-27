@@ -3,19 +3,43 @@ on:
   push:
     tags:
       - 'v*'
+    # Merges to main publish `latest` plus the SHA tag. Remove this block if you
+    # want tag releases and manual runs only.
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag, or refs/pull/<number>/head to build from'
+        required: true
+        default: 'main'
+      push_image:
+        description: 'Push the built image to Docker Hub'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
+# One release at a time: concurrent pushes to the same image tags race each other.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   test-and-release:
     runs-on: ubuntu-latest
+    env:
+      # github.sha points at the default branch for workflow_dispatch, so check out
+      # the requested ref explicitly: a branch, a tag, or refs/pull/<n>/head.
+      CHECKOUT_REF: ${{ inputs.ref || github.ref }}
     steps:
       - name: Checkout repository
         run: |
           git init
           git remote add origin "https://x-access-token:${{ github.token }}@github.com/$GITHUB_REPOSITORY.git"
-          git fetch --depth 1 origin "$GITHUB_SHA"
+          git fetch --depth 1 origin "$CHECKOUT_REF"
           git checkout FETCH_HEAD
 
       - name: Run Go checks and tests
@@ -28,21 +52,30 @@ jobs:
         run: docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/tagwatch:latest .
 
       - name: Push to Docker Hub (main or release tags only)
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push_image)
         run: |
           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
-          
-          # Tag with git commit SHA and latest
+
           IMAGE_NAME="${{ secrets.DOCKERHUB_USERNAME }}/tagwatch"
-          SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
-          
+          SHORT_SHA=$(git rev-parse --short HEAD)
+
+          # `latest` is only moved by main or an official release tag. A manual run
+          # from a branch or PR publishes the SHA tag, so it can be pulled and tested
+          # without disturbing the deployed image.
+          case "$CHECKOUT_REF" in
+            refs/heads/main|refs/tags/*)
+              docker push "$IMAGE_NAME:latest"
+              ;;
+          esac
+
           docker tag "$IMAGE_NAME:latest" "$IMAGE_NAME:$SHORT_SHA"
-          docker push "$IMAGE_NAME:latest"
           docker push "$IMAGE_NAME:$SHORT_SHA"
-          
+
           # If triggered by a git tag (e.g. v1.2.0), also push that exact version tag
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
-            docker tag "$IMAGE_NAME:latest" "$IMAGE_NAME:$RELEASE_TAG"
-            docker push "$IMAGE_NAME:$RELEASE_TAG"
-          fi
+          case "$CHECKOUT_REF" in
+            refs/tags/*)
+              RELEASE_TAG="${CHECKOUT_REF#refs/tags/}"
+              docker tag "$IMAGE_NAME:latest" "$IMAGE_NAME:$RELEASE_TAG"
+              docker push "$IMAGE_NAME:$RELEASE_TAG"
+              ;;
+          esac
