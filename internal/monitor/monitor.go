@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 
@@ -110,28 +111,54 @@ func (m *Monitor) Poll(ctx context.Context) {
 	next := State{Version: 1, Repositories: map[string]*RepositoryState{}}
 	timeout, _ := time.ParseDuration(m.cfg.Timeout)
 	retention := time.Duration(m.cfg.HistoryDays) * 24 * time.Hour
+
+	// One Docker inspection per poll. Its tags also decide which manifests are worth fetching.
+	var containers []docker.Container
+	var dockerErr error
+	if m.runtime != nil {
+		op, cancel := context.WithTimeout(ctx, timeout)
+		containers, dockerErr = m.runtime.Running(op)
+		cancel()
+		if dockerErr != nil {
+			slog.Warn("docker inspection failed", "error", dockerErr)
+		}
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, m.pollConcurrency())
 	for _, r := range m.cfg.Repositories {
 		if ctx.Err() != nil {
-			return
+			break
 		}
-		repo, _ := config.ParseRepository(r.Image)
-		rs := RepositoryState{}
-		if old := m.state.Repositories[repo.Name()]; old != nil {
-			rs = *old
-		}
-		op, cancel := context.WithTimeout(ctx, timeout)
-		tags, err := m.snapshot(op, repo, r)
-		cancel()
-		now := time.Now().UTC()
-		if err != nil {
-			rs.LastAttempt, rs.Error = now, err.Error()
-			slog.Warn("repository check failed", "repository", r.Image, "error", err)
-		} else {
-			rs.Apply(tags, now, retention)
-			slog.Info("repository checked", "repository", r.Image, "tags", len(tags))
-		}
-		next.Repositories[repo.Name()] = &rs
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(r config.Repository) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			repo, _ := config.ParseRepository(r.Image)
+			rs := RepositoryState{}
+			if old := m.state.Repositories[repo.Name()]; old != nil {
+				rs = *old
+			}
+			tags := containerTags(containers, repo.Name())
+			op, cancel := context.WithTimeout(ctx, timeout)
+			result, err := m.snapshot(op, repo, r, rs, tags)
+			cancel()
+			now := time.Now().UTC()
+			if err != nil {
+				rs.LastAttempt, rs.Error = now, err.Error()
+				slog.Warn("repository check failed", "repository", r.Image, "error", err)
+			} else {
+				rs.Apply(result, now, retention)
+				slog.Info("repository checked", "repository", r.Image, "tags", len(result))
+			}
+			mu.Lock()
+			next.Repositories[repo.Name()] = &rs
+			mu.Unlock()
+		}(r)
 	}
+	wg.Wait()
 	if ctx.Err() != nil {
 		return
 	}
@@ -146,13 +173,51 @@ func (m *Monitor) Poll(ctx context.Context) {
 	report := m.makeReport(next, time.Now().UTC())
 	if m.runtime != nil {
 		op, cancel := context.WithTimeout(ctx, timeout)
-		m.addRunning(op, &report)
+		m.addRunning(op, &report, containers, dockerErr)
 		cancel()
 	}
 	m.publish(report)
 }
 
-func (m *Monitor) snapshot(ctx context.Context, repo name.Repository, cfg config.Repository) (map[string]string, error) {
+// pollConcurrency bounds how many repositories are checked at once. Config values are
+// clamped here so a Config built without config.Load still makes progress.
+func (m *Monitor) pollConcurrency() int {
+	n := m.cfg.PollConcurrency
+	if n < 1 {
+		n = 3
+	}
+	if n > len(m.cfg.Repositories) {
+		n = len(m.cfg.Repositories)
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+func (m *Monitor) scanConcurrency() int {
+	n := m.cfg.ScanConcurrency
+	if n < 1 {
+		return 12
+	}
+	if n > 64 {
+		return 64
+	}
+	return n
+}
+
+// containerTags returns the tags of the containers belonging to one repository.
+func containerTags(containers []docker.Container, repo string) []string {
+	var tags []string
+	for _, ctr := range containers {
+		if ctr.Repo == repo && ctr.Tag != "" {
+			tags = append(tags, ctr.Tag)
+		}
+	}
+	return tags
+}
+
+func (m *Monitor) snapshot(ctx context.Context, repo name.Repository, cfg config.Repository, prev RepositoryState, containerTags []string) (map[string]string, error) {
 	tags, err := m.registry.Tags(ctx, repo)
 	if err != nil {
 		return nil, err
@@ -168,8 +233,9 @@ func (m *Monitor) snapshot(ctx context.Context, repo name.Repository, cfg config
 			selected = append(selected, tag)
 		}
 	}
-	// Bound registry traffic. All accepted tags are checked, so moved version tags
-	// are detected too. A partial failure never replaces a complete baseline.
+	// Bound registry traffic. All accepted tags are checked by default, so moved version
+	// tags are detected too. A partial failure never replaces a complete baseline.
+	scan, skip := m.scanTargets(selected, prev, containerTags, cfg.Scope)
 	type result struct {
 		tag, digest string
 		err         error
@@ -179,15 +245,12 @@ func (m *Monitor) snapshot(ctx context.Context, repo name.Repository, cfg config
 	op, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
+	for i := 0; i < m.scanConcurrency(); i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for tag := range jobs {
-				digest, err := m.registry.Digest(op, repo, tag)
-				if err == nil && digest == "" {
-					err = fmt.Errorf("empty manifest digest for %s", tag)
-				}
+				digest, err := m.digest(op, repo, tag)
 				select {
 				case results <- result{tag, digest, err}:
 				case <-op.Done():
@@ -198,7 +261,7 @@ func (m *Monitor) snapshot(ctx context.Context, repo name.Repository, cfg config
 	}
 	go func() {
 		defer close(jobs)
-		for _, tag := range selected {
+		for _, tag := range scan {
 			select {
 			case jobs <- tag:
 			case <-op.Done():
@@ -208,6 +271,9 @@ func (m *Monitor) snapshot(ctx context.Context, repo name.Repository, cfg config
 	}()
 	go func() { wg.Wait(); close(results) }()
 	snapshot := make(map[string]string, len(selected))
+	for tag, digest := range skip {
+		snapshot[tag] = digest
+	}
 	var snapshotErr error
 	for got := range results {
 		if got.err != nil {
@@ -226,6 +292,72 @@ func (m *Monitor) snapshot(ctx context.Context, repo name.Repository, cfg config
 		return nil, err
 	}
 	return snapshot, nil
+}
+
+// scanTargets splits accepted tags into tags that need a manifest request and tags whose
+// known digest is carried forward. scope=pending skips only tags that are already known and
+// cannot produce a pending change: an observed tag at or below the oldest running version is
+// hidden by pendingChanges anyway. Unknown tags are always fetched, so a baseline stays
+// complete and a newly published tag is never missed. Tags equal to a running tag stay
+// scanned because their content still has to be compared.
+func (m *Monitor) scanTargets(selected []string, prev RepositoryState, running []string, scope string) ([]string, map[string]string) {
+	scan := selected
+	if scope != "pending" || !prev.Initialized || len(running) == 0 {
+		return scan, nil
+	}
+	oldest := (*semver.Version)(nil)
+	live := map[string]bool{}
+	for _, tag := range running {
+		live[tag] = true
+		if v := config.Version(tag); v != nil && (oldest == nil || v.LessThan(oldest)) {
+			oldest = v
+		}
+	}
+	if oldest == nil {
+		return scan, nil
+	}
+	skip := map[string]string{}
+	kept := make([]string, 0, len(selected))
+	for _, tag := range selected {
+		if live[tag] {
+			kept = append(kept, tag)
+			continue
+		}
+		v := config.Version(tag)
+		if v == nil || v.GreaterThan(oldest) {
+			kept = append(kept, tag)
+			continue
+		}
+		if digest, ok := prev.Tags[tag]; ok && digest != "" {
+			skip[tag] = digest
+			continue
+		}
+		kept = append(kept, tag)
+	}
+	return kept, skip
+}
+
+// digest retries transient registry failures. A tag that keeps failing still aborts the
+// repository scan, so a partial scan never replaces the baseline.
+func (m *Monitor) digest(ctx context.Context, repo name.Repository, tag string) (string, error) {
+	backoff := []time.Duration{250 * time.Millisecond, time.Second}
+	for attempt := 0; ; attempt++ {
+		digest, err := m.registry.Digest(ctx, repo, tag)
+		if err == nil && digest != "" {
+			return digest, nil
+		}
+		if err == nil {
+			err = fmt.Errorf("empty manifest digest for %s", tag)
+		}
+		if attempt >= len(backoff) {
+			return "", err
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(backoff[attempt]):
+		}
+	}
 }
 
 func (m *Monitor) makeReport(s State, now time.Time) Report {
@@ -328,8 +460,7 @@ func newer(tags map[string]string, baseline string, cfg config.Repository) []str
 	return result
 }
 
-func (m *Monitor) addRunning(ctx context.Context, report *Report) {
-	containers, err := m.runtime.Running(ctx)
+func (m *Monitor) addRunning(ctx context.Context, report *Report, containers []docker.Container, err error) {
 	if err != nil {
 		report.DockerStatus = "Docker inspection failed; running comparisons unavailable: " + err.Error()
 		return

@@ -98,6 +98,8 @@ interval: 1h
 timeout: 5m
 state_file: /data/state.json
 history_days: 30
+scan_concurrency: 12
+poll_concurrency: 3
 docker_socket: ""
 
 repositories:
@@ -115,7 +117,17 @@ fields, and invalid durations are rejected at startup.
 
 - `interval`: delay **after** a complete poll, minimum 1 second.
 - `timeout`: total budget for each repository, and separately for the Docker
-  inspection/comparison phase. Registry digest requests use up to four workers.
+  inspection/comparison phase. Docker is inspected once per poll, before the
+  repository checks start.
+- `scan_concurrency`: manifest requests per repository at the same time, 1–64,
+  default 12. One request per selected tag is what makes a check expensive.
+- `poll_concurrency`: repositories checked at the same time, 1–16, default 3.
+  Requests in flight are `scan_concurrency * poll_concurrency`.
+- `scope`: `all` (default) resolves every selected tag; `pending` carries tags
+  already known and at or below the oldest running version forward from the state
+  file instead of requesting them. Unknown tags are always requested, and a tag
+  equal to a running tag is still requested because its content must be compared.
+  `pending` needs the Docker socket; without running containers nothing is skipped.
 - `history_days`: 1–3650. History does not disappear on the next unchanged poll.
 - `allow` / `deny`: Go regular expressions (RE2), matched against the complete
   original tag string, but **not implicitly anchored**. Use `^` and `$` for exact
@@ -209,7 +221,10 @@ reverse proxy for remote access.
 5. Persist the complete snapshot atomically before publishing the new report.
 
 A repository check is all-or-nothing: tag-list, timeout, or individual manifest
-errors retain the last successful snapshot. Other repositories may still advance.
+errors retain the last successful snapshot. A manifest request that fails is
+retried twice (250 ms, then 1 s) before the repository check is considered
+failed, so a single transient error no longer discards a complete scan. Other
+repositories may still advance.
 A failed state write advances neither the on-disk nor in-memory baseline and
 is prominently reported. An invalid existing state file stops startup rather
 than silently discarding history. Run only one instance per state file/volume.
@@ -252,9 +267,11 @@ can prevent listing even for publicly pullable images.
 
 Remote manifests are checked with HEAD where supported, falling back to GET.
 Requests are bounded by timeouts; the registry library retries selected transient
-failures. Rate-limit and authentication errors are shown in the report and retried
+failures, and each selected tag is retried twice within a repository check.
+Rate-limit and authentication errors are shown in the report and retried
 on the next polling cycle. Registry request quotas still apply; filters reduce
-manifest calls, but listing must discover all tags.
+manifest calls, but listing must discover all tags. `scope: pending` reduces them
+further by trusting the state file for versions that are already running.
 
 ## Local development
 

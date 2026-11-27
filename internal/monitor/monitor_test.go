@@ -22,6 +22,8 @@ type fakeRegistry struct {
 	mu           sync.Mutex
 	tags         map[string]string
 	fail         string
+	flaky        map[string]int
+	requests     []string
 	configDigest string
 	platform     v1.Platform
 }
@@ -38,7 +40,11 @@ func (f *fakeRegistry) Tags(ctx context.Context, repo name.Repository) ([]string
 func (f *fakeRegistry) Digest(ctx context.Context, repo name.Repository, tag string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if tag == f.fail {
+	f.requests = append(f.requests, tag)
+	if tag == f.fail && (f.flaky == nil || f.flaky[tag] > 0) {
+		if f.flaky != nil {
+			f.flaky[tag]--
+		}
 		return "", errors.New("registry unavailable")
 	}
 	return f.tags[tag], nil
@@ -50,12 +56,31 @@ func (f *fakeRegistry) ConfigDigest(ctx context.Context, repo name.Repository, t
 	return f.configDigest, nil
 }
 
+func (f *fakeRegistry) requested() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.requests...)
+}
+
+func (f *fakeRegistry) resetRequests() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requests = nil
+}
+
 type fakeRuntime struct {
 	containers []docker.Container
 	err        error
+	calls      *int
 }
 
-func (f fakeRuntime) Running(context.Context) ([]docker.Container, error) { return f.containers, f.err }
+func (f fakeRuntime) Running(context.Context) ([]docker.Container, error) {
+	// Poll inspects Docker once per cycle, so this counter needs no locking.
+	if f.calls != nil {
+		*f.calls++
+	}
+	return f.containers, f.err
+}
 
 func testConfig(t *testing.T) config.Config {
 	t.Helper()
@@ -410,5 +435,98 @@ func TestCanceledSnapshotDoesNotInitialize(t *testing.T) {
 	m.Poll(ctx)
 	if getReport(m).Repositories[0].Initialized {
 		t.Fatal("canceled poll initialized baseline")
+	}
+}
+
+func TestScopePendingSkipsTagsAlreadyDeployed(t *testing.T) {
+	cfg := testConfig(t)
+	f := &fakeRegistry{tags: map[string]string{"v1.0.0": "a", "v1.1.0": "b", "v1.2.0": "c"}, configDigest: "sha256:current"}
+	rt := fakeRuntime{containers: []docker.Container{
+		{Name: "app", Image: "alpine:v1.2.0", Repo: "index.docker.io/library/alpine", Tag: "v1.2.0", ImageID: "sha256:current", Platform: v1.Platform{OS: "linux", Architecture: "amd64"}},
+	}}
+	m, err := New(cfg, f, rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Poll(context.Background())
+	if got := f.requested(); len(got) != 3 {
+		t.Fatalf("full scan requested %v, want all three tags", got)
+	}
+
+	cfg.Repositories[0].Scope = "pending"
+	f.resetRequests()
+	m, err = New(cfg, f, rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Poll(context.Background())
+	if got := f.requested(); len(got) != 1 || got[0] != "v1.2.0" {
+		t.Fatalf("pending scan requested %v, want only the running tag", got)
+	}
+	row := getReport(m).Repositories[0]
+	if row.TagCount != 3 {
+		t.Fatalf("pruned scan reported %d tags, want the full baseline of 3", row.TagCount)
+	}
+	if len(row.History) != 0 {
+		t.Fatalf("deployed tags still reported: %v", row.History)
+	}
+
+	// A tag published after the baseline must still be found.
+	f.tags["v1.3.0"] = "d"
+	f.resetRequests()
+	m.Poll(context.Background())
+	got := f.requested()
+	if len(got) != 2 || !contains(got, "v1.2.0") || !contains(got, "v1.3.0") {
+		t.Fatalf("pending scan requested %v, want the running tag and the new tag", got)
+	}
+	row = getReport(m).Repositories[0]
+	if len(row.History) != 1 || row.History[0].Tag != "v1.3.0" || row.History[0].Kind != "new tag" {
+		t.Fatalf("new tag not observed: %v", row.History)
+	}
+}
+
+func contains(tags []string, want string) bool {
+	for _, tag := range tags {
+		if tag == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestTransientDigestFailureIsRetried(t *testing.T) {
+	cfg := testConfig(t)
+	f := &fakeRegistry{tags: map[string]string{"1.0.0": "a", "1.1.0": "b"}, fail: "1.1.0", flaky: map[string]int{"1.1.0": 2}}
+	m, err := New(cfg, f, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Poll(context.Background())
+	row := getReport(m).Repositories[0]
+	if row.Error != "" {
+		t.Fatalf("transient failure was reported: %s", row.Error)
+	}
+	if !row.Initialized || row.TagCount != 2 {
+		t.Fatalf("baseline incomplete after retry: %+v", row)
+	}
+	if got := f.requested(); len(got) != 4 {
+		t.Fatalf("requests %v, want 1.1.0 retried twice", got)
+	}
+}
+
+func TestDockerIsInspectedOncePerPoll(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Repositories = []config.Repository{{Image: "alpine"}, {Image: "nginx"}}
+	calls := 0
+	f := &fakeRegistry{tags: map[string]string{"1.0.0": "a"}}
+	m, err := New(cfg, f, fakeRuntime{containers: []docker.Container{
+		{Name: "app", Image: "alpine:1.0.0", Repo: "index.docker.io/library/alpine", Tag: "1.0.0", ImageID: "sha256:current", Platform: v1.Platform{OS: "linux", Architecture: "amd64"}},
+	}, calls: &calls})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Poll(context.Background())
+	if calls != 1 {
+		t.Fatalf("Docker inspected %d times per poll, want 1", calls)
 	}
 }
