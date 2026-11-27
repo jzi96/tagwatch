@@ -6,6 +6,11 @@ timeout: 5m
 state_file: /data/state.json
 history_days: 30
 
+# Requests in flight are scan_concurrency * poll_concurrency.
+# Defaults: 12 manifest requests per repository, 3 repositories at a time.
+scan_concurrency: 12
+poll_concurrency: 3
+
 # Opt-in only. Leave empty when the Docker socket is unavailable.
 docker_socket: ""
 # docker_socket: /var/run/docker.sock
@@ -23,6 +28,9 @@ repositories:
     # Optional when Docker is unavailable: report versions newer than this tag,
     # including on the very first check. Use a full SemVer tag, e.g.:
     # baseline: "v0.11.0"
+    # Optional with Docker enabled: skip manifest requests for tags that cannot
+    # produce a pending change. Default is all, which also detects rebuilt tags.
+    # scope: pending
 
   # Additional examples (only publicly readable repositories are supported):
   # - image: mcr.microsoft.com/dotnet/runtime

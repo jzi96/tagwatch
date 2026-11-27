@@ -14,13 +14,18 @@ import (
 )
 
 type Config struct {
-	Listen       string       `yaml:"listen"`
-	Interval     string       `yaml:"interval"`
-	Timeout      string       `yaml:"timeout"`
-	StateFile    string       `yaml:"state_file"`
-	HistoryDays  int          `yaml:"history_days"`
-	DockerSocket string       `yaml:"docker_socket"`
-	Repositories []Repository `yaml:"repositories"`
+	Listen       string `yaml:"listen"`
+	Interval     string `yaml:"interval"`
+	Timeout      string `yaml:"timeout"`
+	StateFile    string `yaml:"state_file"`
+	HistoryDays  int    `yaml:"history_days"`
+	DockerSocket string `yaml:"docker_socket"`
+	// ScanConcurrency is the number of manifest requests per repository;
+	// PollConcurrency is the number of repositories checked at the same time.
+	// Total requests in flight are the product of both.
+	ScanConcurrency int          `yaml:"scan_concurrency"`
+	PollConcurrency int          `yaml:"poll_concurrency"`
+	Repositories    []Repository `yaml:"repositories"`
 }
 
 type Repository struct {
@@ -30,10 +35,14 @@ type Repository struct {
 	IncludePrereleases bool     `yaml:"include_prereleases"`
 	Allow              []string `yaml:"allow"`
 	Deny               []string `yaml:"deny"`
+	// Scope selects which tags get manifest requests after the baseline exists:
+	// "all" (default) checks every accepted tag, "pending" checks only tags that
+	// could still appear as a pending change.
+	Scope string `yaml:"scope"`
 }
 
 func Load(path string) (Config, error) {
-	c := Config{Listen: ":8080", Interval: "1h", Timeout: "5m", StateFile: "/data/state.json", HistoryDays: 30}
+	c := Config{Listen: ":8080", Interval: "1h", Timeout: "5m", StateFile: "/data/state.json", HistoryDays: 30, ScanConcurrency: 12, PollConcurrency: 3}
 	f, err := os.Open(path)
 	if err != nil {
 		return c, err
@@ -64,6 +73,12 @@ func (c Config) Validate() error {
 	if c.HistoryDays < 1 || c.HistoryDays > 3650 {
 		return fmt.Errorf("history_days must be between 1 and 3650")
 	}
+	if c.ScanConcurrency < 1 || c.ScanConcurrency > 64 {
+		return fmt.Errorf("scan_concurrency must be between 1 and 64")
+	}
+	if c.PollConcurrency < 1 || c.PollConcurrency > 16 {
+		return fmt.Errorf("poll_concurrency must be between 1 and 16")
+	}
 	if len(c.Repositories) == 0 {
 		return fmt.Errorf("configure at least one repository")
 	}
@@ -77,6 +92,9 @@ func (c Config) Validate() error {
 			return fmt.Errorf("duplicate repository %q", r.Image)
 		}
 		seen[repo.Name()] = true
+		if r.Scope != "" && r.Scope != "all" && r.Scope != "pending" {
+			return fmt.Errorf("%s: scope must be all or pending", r.Image)
+		}
 		for _, pattern := range append(append([]string{}, r.Allow...), r.Deny...) {
 			if _, err := regexp.Compile(pattern); err != nil {
 				return fmt.Errorf("%s: invalid filter: %w", r.Image, err)

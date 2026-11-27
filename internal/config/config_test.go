@@ -77,6 +77,15 @@ func TestLoad(t *testing.T) {
 	if c.HistoryDays != 30 || c.Interval != "1h" || c.DockerSocket != "" {
 		t.Fatalf("defaults: %+v", c)
 	}
+	if c.ScanConcurrency != 12 || c.PollConcurrency != 3 {
+		t.Fatalf("scan defaults: %+v", c)
+	}
+	save("repositories:\n  - image: alpine\n    scope: pending\nscan_concurrency: 32\npoll_concurrency: 8\n")
+	if parsed, err := Load(path); err != nil {
+		t.Fatal(err)
+	} else if parsed.ScanConcurrency != 32 || parsed.PollConcurrency != 8 || parsed.Repositories[0].Scope != "pending" {
+		t.Fatalf("explicit scan settings: %+v", parsed)
+	}
 	for _, input := range []string{
 		"repositories: []",
 		"interval: 0s\nrepositories:\n  - image: alpine",
@@ -85,6 +94,11 @@ func TestLoad(t *testing.T) {
 		"repositories:\n  - image: alpine\n  - image: docker.io/library/alpine",
 		"repositories:\n  - image: alpine\n    baseline: latest",
 		"repositories:\n  - image: alpine\n---\nrepositories: []",
+		"scan_concurrency: 0\nrepositories:\n  - image: alpine",
+		"scan_concurrency: 100\nrepositories:\n  - image: alpine",
+		"poll_concurrency: 0\nrepositories:\n  - image: alpine",
+		"poll_concurrency: 20\nrepositories:\n  - image: alpine",
+		"repositories:\n  - image: alpine\n    scope: everything",
 	} {
 		save(input)
 		if _, err := Load(path); err == nil {
